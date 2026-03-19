@@ -6,7 +6,6 @@
 ## 当前默认
 
 - 默认模型：`gemini-3.1-pro-preview`
-- 默认模式：`single`
 - 默认输出：`compact`
 - 接口：`POST {YUNWU_BASE_URL}/v1beta/models/{model}:generateContent`
 
@@ -28,20 +27,20 @@
 python3 ./scripts/run_analysis.py \
   --video "https://www.youtube.com/watch?v=xxxx" \
   --brief-file ./brief.txt \
-  --mode single \
   --output-profile compact \
   --output ./result.json
 ```
 
-仅构造请求不发送：
+仅在你显式调用 `--dry-run` 时，才构造请求体而不发送。默认建议只打印到 stdout，不落盘：
 
 ```bash
 python3 ./scripts/run_analysis.py \
   --video-file-uri "https://example.com/video.mp4" \
   --brief "test" \
-  --dry-run \
-  --output ./request.json
+  --dry-run
 ```
+
+只有在你同时显式传 `--dry-run --output xxx.json` 时，才会写出这类调试文件。
 
 ## 输出核心字段（single/compact）
 

@@ -1,21 +1,93 @@
 #!/usr/bin/env python3
 import argparse
+import atexit
 import base64
 import json
 import mimetypes
 import os
 import re
+import signal
 import sys
+import threading
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 
 DEFAULT_BASE_URL = "https://yunwu.ai"
-DEFAULT_MODEL = "gemini-3.1-pro-preview"
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.1-pro-preview"
 INLINE_LIMIT_BYTES = 20 * 1024 * 1024
 SHOT_LABEL_RE = re.compile(r"\b(?:shot|Shot)\s*\d+\b|镜头\s*\d+|片段\s*\d+|s\d+\b")
 ASSET_TAG_RE = re.compile(r"@\S+|--ref\s+\S+")
+
+# 智能重试配置
+DEFAULT_MAX_RETRIES = 0  # 重型多模态请求默认不自动重试，避免重复计费
+RETRY_BACKOFF_SECONDS = [10, 30]  # 指数退避等待时间
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+# 心跳间隔（秒）
+HEARTBEAT_INTERVAL = 10
+
+
+class AnalysisTimeoutError(Exception):
+    """等待分析结果超时，状态不明确，避免自动重提。"""
+    def __init__(self, message: str, request_meta: dict | None = None):
+        super().__init__(message)
+        self.request_meta = request_meta or {}
+
+
+class AnalysisRequestError(Exception):
+    """请求失败，但尽量保留服务端 request-id 等调试信息。"""
+    def __init__(self, message: str, request_meta: dict | None = None):
+        super().__init__(message)
+        self.request_meta = request_meta or {}
+
+
+# ---------------------------------------------------------------------------
+# Lock File 防重入机制
+# ---------------------------------------------------------------------------
+
+_lock_path: str | None = None
+
+
+def _resolve_lock_path(output_path: str | None) -> Path:
+    """根据 --output 参数确定 lock 文件位置。"""
+    if output_path:
+        return Path(output_path).parent / ".run_analysis.lock"
+    return Path.cwd() / ".run_analysis.lock"
+
+
+def acquire_lock(output_path: str | None) -> None:
+    """尝试获取 lock，如果已有同名活跃进程则拒绝启动。"""
+    global _lock_path
+    lock = _resolve_lock_path(output_path)
+    if lock.exists():
+        try:
+            old_pid = int(lock.read_text().strip())
+            # 检查进程是否仍在运行（发送信号 0 不会杀死进程）
+            os.kill(old_pid, 0)
+            print(
+                f"error: 另一个 run_analysis 实例 (PID {old_pid}) 正在运行中。"
+                f"如需强制重新运行，请先删除 {lock}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        except (ProcessLookupError, ValueError):
+            # 旧进程已不存在或 lock 内容无效，安全地覆盖
+            pass
+    lock.write_text(str(os.getpid()))
+    _lock_path = str(lock)
+    atexit.register(_release_lock)
+
+
+def _release_lock() -> None:
+    """进程退出时自动清理 lock 文件。"""
+    if _lock_path:
+        try:
+            Path(_lock_path).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +130,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--token",
         help="API token. Defaults to YUNWU_API_TOKEN or GEMINI_API_TOKEN.",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=600,
+        help="HTTP request timeout seconds. Use a longer timeout for heavy video analysis.",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help="Automatic retry count for 429/5xx/network errors. Default 0 to avoid ambiguous duplicate submissions.",
     )
     parser.add_argument(
         "--output",
@@ -464,23 +548,187 @@ def write_output(path: str | None, payload: dict) -> None:
         print(text)
 
 
-def send_request(args: argparse.Namespace, payload: dict) -> dict:
+def build_result_envelope(
+    *,
+    status: str,
+    success: bool,
+    failure_reason: str = "",
+    should_retry: bool | None = None,
+    retry_guidance: str = "",
+    result: dict | None = None,
+    request_meta: dict | None = None,
+) -> dict:
+    payload = dict(result or {})
+    payload["analysis_status"] = status
+    payload["success"] = success
+    payload["failure_reason"] = failure_reason
+    payload["should_retry"] = should_retry
+    payload["retry_guidance"] = retry_guidance
+    payload["server_request_ids"] = dict(request_meta or {})
+    return payload
+
+
+def validate_analysis_result(result: dict) -> None:
+    if not isinstance(result, dict):
+        raise ValueError("API did not return a JSON object.")
+    required = [
+        "story_adaptation_outline",
+        "asset_library",
+        "asset_layout_rules",
+        "storyboard_script",
+        "voiceover_script",
+        "validation_report",
+    ]
+    missing = [key for key in required if key not in result]
+    if missing:
+        raise ValueError(f"Analysis result is missing required keys: {', '.join(missing)}")
+
+
+def extract_request_meta(headers) -> dict:
+    if not headers:
+        return {}
+    candidates = [
+        "request-id",
+        "x-request-id",
+        "x-requestid",
+        "trace-id",
+        "x-trace-id",
+        "traceparent",
+        "cf-ray",
+        "x-b3-traceid",
+    ]
+    out = {}
+    for key in candidates:
+        value = headers.get(key)
+        if value:
+            out[key] = value
+    return out
+
+
+def send_request(args: argparse.Namespace, payload: dict) -> tuple[dict, dict]:
+    """发送 API 请求，带心跳输出和基于 HTTP 状态码的智能重试。"""
     token = args.token or os.getenv("YUNWU_API_TOKEN") or os.getenv("GEMINI_API_TOKEN")
     if not token:
         raise ValueError("Missing token. Set --token or YUNWU_API_TOKEN.")
 
     url = f"{args.base_url.rstrip('/')}/v1beta/models/{args.model}:generateContent"
-    request = urllib.request.Request(
-        url=url,
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(request) as response:
-        return json.loads(response.read().decode("utf-8"))
+    data_bytes = json.dumps(payload).encode("utf-8")
+    max_retries = max(0, int(getattr(args, "max_retries", DEFAULT_MAX_RETRIES)))
+
+    for attempt in range(1 + max_retries):
+        req = urllib.request.Request(
+            url=url,
+            data=data_bytes,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+
+        # ---- 心跳线程：每 HEARTBEAT_INTERVAL 秒输出一行状态 ----
+        stop_heartbeat = threading.Event()
+        start_time = time.time()
+
+        def _heartbeat_loop():
+            while not stop_heartbeat.is_set():
+                stop_heartbeat.wait(HEARTBEAT_INTERVAL)
+                if not stop_heartbeat.is_set():
+                    elapsed = int(time.time() - start_time)
+                    print(
+                        f"[heartbeat] 正在等待 API 响应... (已等待 {elapsed}s)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+        heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+        heartbeat_thread.start()
+
+        try:
+            with urllib.request.urlopen(req, timeout=args.request_timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+                request_meta = extract_request_meta(response.headers)
+                elapsed = int(time.time() - start_time)
+                print(
+                    f"[info] API 请求成功 (耗时 {elapsed}s)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return result, request_meta
+
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            elapsed = int(time.time() - start_time)
+            request_meta = extract_request_meta(exc.headers)
+
+            # 不可重试的客户端错误
+            if status not in RETRYABLE_STATUS_CODES:
+                print(
+                    f"[error] API 返回 HTTP {status}，属于不可重试错误，立即终止。(耗时 {elapsed}s)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise AnalysisRequestError(
+                    f"API request failed with HTTP {status}: {exc.read().decode('utf-8', errors='replace')}",
+                    request_meta=request_meta,
+                ) from exc
+
+            # 可重试的服务端错误 / 频率限制
+            if attempt < max_retries:
+                # 优先使用 Retry-After 头（429 场景）
+                retry_after = exc.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    wait = int(retry_after)
+                else:
+                    wait = RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)]
+                print(
+                    f"[warn] API 返回 HTTP {status}，将在 {wait}s 后重试 "
+                    f"(第 {attempt + 1}/{max_retries} 次重试，已等待 {elapsed}s)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(wait)
+            else:
+                print(
+                    f"[error] API 返回 HTTP {status}，已达到最大重试次数 ({max_retries})，终止。",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise AnalysisRequestError(
+                    f"API request failed after {max_retries} retries with HTTP {status}",
+                    request_meta=request_meta,
+                ) from exc
+
+        except urllib.error.URLError as exc:
+            elapsed = int(time.time() - start_time)
+            reason = exc.reason
+            ambiguous = isinstance(reason, TimeoutError) or "timed out" in str(reason).lower()
+            if attempt < max_retries and not ambiguous:
+                wait = RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)]
+                print(
+                    f"[warn] 网络错误: {exc.reason}，将在 {wait}s 后重试 "
+                    f"(第 {attempt + 1}/{max_retries} 次重试，已等待 {elapsed}s)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(wait)
+            else:
+                if ambiguous:
+                    raise AnalysisTimeoutError(
+                        "Request timed out before a response was received. The server may still be processing it.",
+                        request_meta={},
+                    ) from exc
+                raise AnalysisRequestError(
+                    f"Network error after {max_retries} retries: {exc.reason}",
+                    request_meta={},
+                ) from exc
+
+        finally:
+            stop_heartbeat.set()
+            heartbeat_thread.join(timeout=2)
+
+    # 理论上不会执行到这里
+    raise ValueError("Unexpected: exhausted all retry attempts.")
 
 
 def parse_json_text(text: str) -> dict | None:
@@ -691,19 +939,76 @@ def normalize_structured_output(result: dict) -> dict:
 
 
 def main() -> int:
+    args: argparse.Namespace | None = None
     try:
         args = parse_args()
+        # 防重入：dry-run 模式不需要 lock（不会发起真实请求）
+        if not args.dry_run:
+            acquire_lock(args.output)
         payload = build_request(args)
         if args.dry_run:
             write_output(args.output, payload)
             return 0
-        response = send_request(args, payload)
+        response, request_meta = send_request(args, payload)
         parsed = unwrap_response_json(response)
         # 仅使用本地后处理，不再发起二次 API 调用做中文修复
         parsed = normalize_structured_output(parsed)
-        write_output(args.output, parsed)
+        validate_analysis_result(parsed)
+        write_output(
+            args.output,
+            build_result_envelope(
+                status="ok",
+                success=True,
+                should_retry=False,
+                retry_guidance="",
+                result=parsed,
+                request_meta=request_meta,
+            ),
+        )
         return 0
+    except AnalysisTimeoutError as exc:
+        write_output(
+            args.output if args else None,
+            build_result_envelope(
+                status="timeout",
+                success=False,
+                failure_reason=str(exc),
+                should_retry=None,
+                retry_guidance=(
+                    "本次请求长时间未返回，服务端可能仍在处理中。先检查 provider 侧状态或稍后人工确认，"
+                    "再决定是否重试，避免重复扣费。"
+                ),
+                request_meta=exc.request_meta,
+            ),
+        )
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except AnalysisRequestError as exc:
+        write_output(
+            args.output if args else None,
+            build_result_envelope(
+                status="failed",
+                success=False,
+                failure_reason=str(exc),
+                should_retry=False,
+                retry_guidance="先检查错误原因和服务端 request id，再决定是否重试。",
+                request_meta=exc.request_meta,
+            ),
+        )
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     except Exception as exc:
+        write_output(
+            args.output if args else None,
+            build_result_envelope(
+                status="failed",
+                success=False,
+                failure_reason=str(exc),
+                should_retry=False,
+                retry_guidance="先修复错误原因后再重试；HTTP 4xx 或输入问题通常不应直接重试。",
+                request_meta={},
+            ),
+        )
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
