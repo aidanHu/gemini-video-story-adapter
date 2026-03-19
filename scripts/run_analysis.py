@@ -14,7 +14,6 @@ from pathlib import Path
 DEFAULT_BASE_URL = "https://yunwu.ai"
 DEFAULT_MODEL = "gemini-3.1-pro-preview"
 INLINE_LIMIT_BYTES = 20 * 1024 * 1024
-ENGLISH_WORD_RE = re.compile(r"[A-Za-z]{2,}")
 SHOT_LABEL_RE = re.compile(r"\b(?:shot|Shot)\s*\d+\b|镜头\s*\d+|片段\s*\d+|s\d+\b")
 ASSET_TAG_RE = re.compile(r"@\S+|--ref\s+\S+")
 
@@ -39,14 +38,6 @@ def parse_args() -> argparse.Namespace:
         help="Path to a text file containing the adaptation brief.",
     )
     parser.add_argument(
-        "--proposal-file",
-        help="Path to approved proposal JSON from phase 1. Used only when mode=two-phase and phase=execution.",
-    )
-    parser.add_argument(
-        "--proposal-json",
-        help="Approved proposal JSON string from phase 1. Alternative to --proposal-file.",
-    )
-    parser.add_argument(
         "--reference",
         action="append",
         default=[],
@@ -58,18 +49,6 @@ def parse_args() -> argparse.Namespace:
         choices=["compact", "full"],
         default="compact",
         help="compact saves tokens by returning only core fields; full keeps all rich fields.",
-    )
-    parser.add_argument(
-        "--mode",
-        choices=["single", "two-phase"],
-        default="single",
-        help="single returns the full package in one response; two-phase splits proposal and execution.",
-    )
-    parser.add_argument(
-        "--phase",
-        choices=["full", "proposal", "execution"],
-        default="full",
-        help="full returns all structured content. proposal/execution are used with mode=two-phase.",
     )
     parser.add_argument(
         "--base-url",
@@ -158,42 +137,16 @@ def build_prompt(brief: str, references: list[str]) -> str:
     )
 
 
-def load_proposal_context(args: argparse.Namespace) -> str:
-    if args.proposal_json:
-        return args.proposal_json.strip()
-    if args.proposal_file:
-        return Path(args.proposal_file).read_text(encoding="utf-8").strip()
-    return ""
-
-
-def build_seedance_prompt(
-    brief: str, references: list[str], mode: str, phase: str, approved_proposal: str, output_profile: str
-) -> str:
+def build_seedance_prompt(brief: str, references: list[str], output_profile: str) -> str:
+    """构建 Seedance 分析 prompt，仅支持 single-pass 模式。"""
     reference_lines = "\n".join(
         f"- @图片{idx + 1}: treat this as a user-supplied visual reference anchor"
         for idx, _ in enumerate(references)
     )
-    if mode == "single":
-        phase_instruction = (
-            "Current mode is SINGLE PASS. Return the full package in one response: "
-            "global visual definition, story adaptation outline, asset library, asset layout rules, storyboard script, voiceover script, and validation report."
-        )
-    elif phase == "proposal":
-        phase_instruction = (
-            "Current phase is PHASE 1 PROPOSAL. Return only the proposal package. "
-            "Do not output storyboard shots, dialogue script, or execution prose."
-        )
-    else:
-        phase_instruction = (
-            "Current phase is PHASE 2 EXECUTION. Return only storyboard and voiceover output. "
-            "Treat the approved proposal JSON below as binding context. Do not contradict its asset tags, wording, or approved direction. "
-            "Do not repeat the full proposal except where required for standalone shot prompts."
-        )
-    proposal_block = (
-        ""
-        if mode == "single" or phase == "proposal"
-        else "\n\nApproved proposal JSON:\n"
-        + (approved_proposal if approved_proposal else "{}")
+    phase_instruction = (
+        "Return the full package in one response: "
+        "global visual definition, story adaptation outline, asset library, asset layout rules, "
+        "storyboard script, voiceover script, and validation report."
     )
     compact_instruction = (
         "Output profile is COMPACT: keep every field concise, avoid repetition, and use short practical wording."
@@ -205,7 +158,6 @@ def build_seedance_prompt(
         "Target platform: Seedance 2.0. Output must obey strict physical logic, stable background continuity, "
         "and SCELA prompt methodology.\n\n"
         "Non-negotiable rules:\n"
-        "- Enforce two-phase workflow strictly.\n"
         "- Character mapping table (fixed visual identifiers): "
         "Rumi->紫发女人 | Mira->红发女人 | Zoey->黑发女人 | Jinu->黑发男人 | "
         "Abby->红发男人 | Baby saja->蓝发男人 | Mystery->银发男人 | Romance->粉发男人.\n"
@@ -270,350 +222,182 @@ def build_seedance_prompt(
         f"{phase_instruction}\n\n"
         "User brief:\n"
         f"{brief.strip()}"
-        f"{proposal_block}"
     )
 
 
-def build_proposal_schema() -> dict:
-    return {
-        "type": "OBJECT",
-        "required": [
-            "phase",
-            "global_visual_definition",
-            "story_adaptation_outline",
-            "asset_library",
-            "asset_layout_rules",
-            "approval_checkpoint",
-        ],
-        "properties": {
-            "phase": {"type": "STRING", "enum": ["proposal"]},
-            "global_visual_definition": {
+def build_schema(output_profile: str) -> dict:
+    """构建完整的 single-pass response schema。"""
+    # 资产库 schema
+    if output_profile == "compact":
+        asset_item = {
+            "type": "OBJECT",
+            "required": ["asset_tag", "asset_category", "visual_anchor", "layout", "full_prompt_string"],
+            "properties": {
+                "asset_tag": {"type": "STRING"},
+                "asset_category": {"type": "STRING"},
+                "visual_anchor": {"type": "STRING"},
+                "layout": {"type": "STRING"},
+                "full_prompt_string": {"type": "STRING"},
+                "wardrobe_design": {"type": "STRING"},
+                "makeup_design": {"type": "STRING"},
+                "accessory_design": {"type": "STRING"},
+            },
+        }
+        story_outline = {
+            "type": "OBJECT",
+            "required": ["premise", "beat_outline"],
+            "properties": {
+                "premise": {"type": "STRING"},
+                "beat_outline": {"type": "ARRAY", "items": {"type": "STRING"}},
+            },
+        }
+        shot_required = [
+            "shot_id", "duration_seconds", "scene_tag", "scene_description",
+            "used_asset_tags", "used_props", "continuity_from_prev",
+            "full_prompt_string", "first_frame_prompt", "scela_prompt",
+            "dialogue", "audio",
+        ]
+        shot_properties = {
+            "shot_id": {"type": "STRING"},
+            "duration_seconds": {"type": "NUMBER"},
+            "scene_tag": {"type": "STRING"},
+            "scene_description": {"type": "STRING"},
+            "used_asset_tags": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "used_props": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "continuity_from_prev": {"type": "STRING"},
+            "full_prompt_string": {"type": "STRING"},
+            "first_frame_prompt": {"type": "STRING"},
+            "scela_prompt": {"type": "STRING"},
+            "dialogue": {"type": "STRING"},
+            "audio": {"type": "STRING"},
+            "referenced_assets": {"type": "ARRAY", "items": {"type": "STRING"}},
+        }
+        validation_required = [
+            "undefined_asset_tags", "missing_scene_context_shots",
+            "missing_prop_context_shots", "rule_violations",
+        ]
+        validation_properties = {
+            "undefined_asset_tags": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "missing_scene_context_shots": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "missing_prop_context_shots": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "rule_violations": {"type": "ARRAY", "items": {"type": "STRING"}},
+        }
+        required_top = [
+            "story_adaptation_outline", "asset_library", "asset_layout_rules",
+            "storyboard_script", "voiceover_script", "validation_report",
+        ]
+    else:
+        asset_item = {
+            "type": "OBJECT",
+            "required": ["asset_tag", "asset_category", "visual_anchor", "layout", "full_prompt_string"],
+            "properties": {
+                "asset_tag": {"type": "STRING"},
+                "asset_category": {"type": "STRING"},
+                "visual_anchor": {"type": "STRING"},
+                "motion_potential": {"type": "STRING"},
+                "material_details": {"type": "ARRAY", "items": {"type": "STRING"}},
+                "environment_details": {"type": "ARRAY", "items": {"type": "STRING"}},
+                "layout": {"type": "STRING"},
+                "full_prompt_string": {"type": "STRING"},
+                "wardrobe_design": {"type": "STRING"},
+                "makeup_design": {"type": "STRING"},
+                "accessory_design": {"type": "STRING"},
+            },
+        }
+        story_outline = {
+            "type": "OBJECT",
+            "required": ["premise", "micro_innovation_strategy", "beat_outline"],
+            "properties": {
+                "premise": {"type": "STRING"},
+                "micro_innovation_strategy": {"type": "STRING"},
+                "preserve_from_benchmark": {"type": "ARRAY", "items": {"type": "STRING"}},
+                "replace_from_benchmark": {"type": "ARRAY", "items": {"type": "STRING"}},
+                "beat_outline": {"type": "ARRAY", "items": {"type": "STRING"}},
+            },
+        }
+        shot_required = [
+            "shot_id", "theme", "duration_seconds", "scene_tag", "scene_description",
+            "used_asset_tags", "used_props", "continuity_from_prev",
+            "aspect_ratio", "narrative_mode",
+            "full_prompt_string", "first_frame_prompt", "scela_prompt",
+            "dialogue", "audio",
+        ]
+        shot_properties = {
+            "shot_id": {"type": "STRING"},
+            "theme": {"type": "STRING"},
+            "duration_seconds": {"type": "NUMBER"},
+            "scene_tag": {"type": "STRING"},
+            "scene_description": {"type": "STRING"},
+            "used_asset_tags": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "used_props": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "continuity_from_prev": {"type": "STRING"},
+            "aspect_ratio": {"type": "STRING"},
+            "narrative_mode": {"type": "STRING"},
+            "full_prompt_string": {"type": "STRING"},
+            "benchmark_inheritance": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "override_notes": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "first_frame_prompt": {"type": "STRING"},
+            "scela_prompt": {"type": "STRING"},
+            "dialogue": {"type": "STRING"},
+            "audio": {"type": "STRING"},
+            "referenced_assets": {"type": "ARRAY", "items": {"type": "STRING"}},
+        }
+        validation_required = [
+            "undefined_asset_tags", "missing_scene_context_shots",
+            "missing_prop_context_shots", "shot_count_check", "rule_violations",
+        ]
+        validation_properties = {
+            "undefined_asset_tags": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "missing_scene_context_shots": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "missing_prop_context_shots": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "shot_count_check": {"type": "STRING"},
+            "rule_violations": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "assumptions": {"type": "ARRAY", "items": {"type": "STRING"}},
+        }
+        required_top = [
+            "global_visual_definition", "story_adaptation_outline",
+            "asset_library", "asset_layout_rules",
+            "storyboard_script", "voiceover_script", "validation_report",
+        ]
+
+    top_properties = {
+        "story_adaptation_outline": story_outline,
+        "asset_library": {"type": "ARRAY", "items": asset_item},
+        "asset_layout_rules": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "storyboard_script": {
+            "type": "ARRAY",
+            "items": {"type": "OBJECT", "required": shot_required, "properties": shot_properties},
+        },
+        "voiceover_script": {
+            "type": "ARRAY",
+            "items": {
                 "type": "OBJECT",
-                "required": [
-                    "target_platform",
-                    "visual_style",
-                    "narrative_mode",
-                    "runtime_strategy",
-                    "continuity_rules",
-                ],
-                "properties": {
-                    "target_platform": {"type": "STRING"},
-                    "visual_style": {"type": "STRING"},
-                    "narrative_mode": {"type": "STRING"},
-                    "runtime_strategy": {"type": "STRING"},
-                    "continuity_rules": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    "compliance_notes": {"type": "ARRAY", "items": {"type": "STRING"}},
-                },
-            },
-            "story_adaptation_outline": {
-                "type": "OBJECT",
-                "required": ["premise", "micro_innovation_strategy", "beat_outline"],
-                "properties": {
-                    "premise": {"type": "STRING"},
-                    "micro_innovation_strategy": {"type": "STRING"},
-                    "preserve_from_benchmark": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    "replace_from_benchmark": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    "beat_outline": {"type": "ARRAY", "items": {"type": "STRING"}},
-                },
-            },
-            "asset_library": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "required": ["asset_tag", "asset_category", "visual_anchor", "layout", "full_prompt_string"],
-                    "properties": {
-                        "asset_tag": {"type": "STRING"},
-                        "asset_category": {"type": "STRING"},
-                        "visual_anchor": {"type": "STRING"},
-                        "motion_potential": {"type": "STRING"},
-                        "material_details": {
-                            "type": "ARRAY",
-                            "items": {"type": "STRING"},
-                        },
-                        "environment_details": {
-                            "type": "ARRAY",
-                            "items": {"type": "STRING"},
-                        },
-                        "layout": {"type": "STRING"},
-                        "full_prompt_string": {"type": "STRING"},
-                        "wardrobe_design": {"type": "STRING"},
-                        "makeup_design": {"type": "STRING"},
-                        "accessory_design": {"type": "STRING"},
-                    },
-                },
-            },
-            "asset_layout_rules": {
-                "type": "ARRAY",
-                "items": {"type": "STRING"},
-            },
-            "approval_checkpoint": {
-                "type": "OBJECT",
-                "required": ["status", "next_action"],
-                "properties": {
-                    "status": {"type": "STRING"},
-                    "next_action": {"type": "STRING"},
-                    "questions_for_user": {"type": "ARRAY", "items": {"type": "STRING"}},
-                },
+                "required": ["shot_id", "line"],
+                "properties": {"shot_id": {"type": "STRING"}, "line": {"type": "STRING"}},
             },
         },
-    }
-
-
-def build_proposal_schema_compact() -> dict:
-    return {
-        "type": "OBJECT",
-        "required": ["phase", "story_adaptation_outline", "asset_library", "asset_layout_rules", "approval_checkpoint"],
-        "properties": {
-            "phase": {"type": "STRING", "enum": ["proposal"]},
-            "story_adaptation_outline": {
-                "type": "OBJECT",
-                "required": ["premise", "beat_outline"],
-                "properties": {
-                    "premise": {"type": "STRING"},
-                    "beat_outline": {"type": "ARRAY", "items": {"type": "STRING"}},
-                },
-            },
-            "asset_library": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "required": [
-                        "asset_tag",
-                        "asset_category",
-                        "visual_anchor",
-                        "layout",
-                        "full_prompt_string",
-                    ],
-                    "properties": {
-                        "asset_tag": {"type": "STRING"},
-                        "asset_category": {"type": "STRING"},
-                        "visual_anchor": {"type": "STRING"},
-                        "layout": {"type": "STRING"},
-                        "full_prompt_string": {"type": "STRING"},
-                        "wardrobe_design": {"type": "STRING"},
-                        "makeup_design": {"type": "STRING"},
-                        "accessory_design": {"type": "STRING"},
-                    },
-                },
-            },
-            "asset_layout_rules": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "approval_checkpoint": {
-                "type": "OBJECT",
-                "required": ["status", "next_action"],
-                "properties": {
-                    "status": {"type": "STRING"},
-                    "next_action": {"type": "STRING"},
-                },
-            },
+        "validation_report": {
+            "type": "OBJECT",
+            "required": validation_required,
+            "properties": validation_properties,
         },
     }
-
-
-def build_execution_schema() -> dict:
-    return {
-        "type": "OBJECT",
-        "required": ["phase", "storyboard_script", "voiceover_script", "validation_report"],
-        "properties": {
-            "phase": {"type": "STRING", "enum": ["execution"]},
-            "storyboard_script": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "required": [
-                        "shot_id",
-                        "theme",
-                        "duration_seconds",
-                        "scene_tag",
-                        "scene_description",
-                        "used_asset_tags",
-                        "used_props",
-                        "continuity_from_prev",
-                        "aspect_ratio",
-                        "narrative_mode",
-                        "full_prompt_string",
-                        "first_frame_prompt",
-                        "scela_prompt",
-                        "dialogue",
-                        "audio",
-                    ],
-                    "properties": {
-                        "shot_id": {"type": "STRING"},
-                        "theme": {"type": "STRING"},
-                        "duration_seconds": {"type": "NUMBER"},
-                        "scene_tag": {"type": "STRING"},
-                        "scene_description": {"type": "STRING"},
-                        "used_asset_tags": {"type": "ARRAY", "items": {"type": "STRING"}},
-                        "used_props": {"type": "ARRAY", "items": {"type": "STRING"}},
-                        "continuity_from_prev": {"type": "STRING"},
-                        "aspect_ratio": {"type": "STRING"},
-                        "narrative_mode": {"type": "STRING"},
-                        "full_prompt_string": {"type": "STRING"},
-                        "benchmark_inheritance": {"type": "ARRAY", "items": {"type": "STRING"}},
-                        "override_notes": {"type": "ARRAY", "items": {"type": "STRING"}},
-                        "first_frame_prompt": {"type": "STRING"},
-                        "scela_prompt": {"type": "STRING"},
-                        "dialogue": {"type": "STRING"},
-                        "audio": {"type": "STRING"},
-                        "referenced_assets": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    },
-                },
+    # full 模式额外需要 global_visual_definition
+    if output_profile != "compact":
+        top_properties["global_visual_definition"] = {
+            "type": "OBJECT",
+            "required": ["target_platform", "visual_style", "narrative_mode", "runtime_strategy", "continuity_rules"],
+            "properties": {
+                "target_platform": {"type": "STRING"},
+                "visual_style": {"type": "STRING"},
+                "narrative_mode": {"type": "STRING"},
+                "runtime_strategy": {"type": "STRING"},
+                "continuity_rules": {"type": "ARRAY", "items": {"type": "STRING"}},
+                "compliance_notes": {"type": "ARRAY", "items": {"type": "STRING"}},
             },
-            "voiceover_script": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "required": ["shot_id", "line"],
-                    "properties": {
-                        "shot_id": {"type": "STRING"},
-                        "line": {"type": "STRING"},
-                    },
-                },
-            },
-            "validation_report": {
-                "type": "OBJECT",
-                "required": [
-                    "undefined_asset_tags",
-                    "missing_scene_context_shots",
-                    "missing_prop_context_shots",
-                    "shot_count_check",
-                    "rule_violations",
-                ],
-                "properties": {
-                    "undefined_asset_tags": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    "missing_scene_context_shots": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    "missing_prop_context_shots": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    "shot_count_check": {"type": "STRING"},
-                    "rule_violations": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    "assumptions": {"type": "ARRAY", "items": {"type": "STRING"}},
-                },
-            },
-        },
-    }
+        }
 
-
-def build_execution_schema_compact() -> dict:
-    return {
-        "type": "OBJECT",
-        "required": ["phase", "storyboard_script", "voiceover_script", "validation_report"],
-        "properties": {
-            "phase": {"type": "STRING", "enum": ["execution"]},
-            "storyboard_script": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "required": [
-                        "shot_id",
-                        "duration_seconds",
-                        "scene_tag",
-                        "scene_description",
-                        "used_asset_tags",
-                        "used_props",
-                        "continuity_from_prev",
-                        "full_prompt_string",
-                        "first_frame_prompt",
-                        "scela_prompt",
-                        "dialogue",
-                        "audio",
-                    ],
-                    "properties": {
-                        "shot_id": {"type": "STRING"},
-                        "duration_seconds": {"type": "NUMBER"},
-                        "scene_tag": {"type": "STRING"},
-                        "scene_description": {"type": "STRING"},
-                        "used_asset_tags": {"type": "ARRAY", "items": {"type": "STRING"}},
-                        "used_props": {"type": "ARRAY", "items": {"type": "STRING"}},
-                        "continuity_from_prev": {"type": "STRING"},
-                        "full_prompt_string": {"type": "STRING"},
-                        "first_frame_prompt": {"type": "STRING"},
-                        "scela_prompt": {"type": "STRING"},
-                        "dialogue": {"type": "STRING"},
-                        "audio": {"type": "STRING"},
-                        "referenced_assets": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    },
-                },
-            },
-            "voiceover_script": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "required": ["shot_id", "line"],
-                    "properties": {
-                        "shot_id": {"type": "STRING"},
-                        "line": {"type": "STRING"},
-                    },
-                },
-            },
-            "validation_report": {
-                "type": "OBJECT",
-                "required": [
-                    "undefined_asset_tags",
-                    "missing_scene_context_shots",
-                    "missing_prop_context_shots",
-                    "rule_violations",
-                ],
-                "properties": {
-                    "undefined_asset_tags": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    "missing_scene_context_shots": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    "missing_prop_context_shots": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    "rule_violations": {"type": "ARRAY", "items": {"type": "STRING"}},
-                },
-            },
-        },
-    }
-
-
-def build_full_schema() -> dict:
-    proposal_schema = build_proposal_schema()["properties"]
-    execution_schema = build_execution_schema()["properties"]
-    return {
-        "type": "OBJECT",
-        "required": [
-            "mode",
-            "global_visual_definition",
-            "story_adaptation_outline",
-            "asset_library",
-            "asset_layout_rules",
-            "storyboard_script",
-            "voiceover_script",
-            "validation_report",
-        ],
-        "properties": {
-            "mode": {"type": "STRING", "enum": ["single"]},
-            "global_visual_definition": proposal_schema["global_visual_definition"],
-            "story_adaptation_outline": proposal_schema["story_adaptation_outline"],
-            "asset_library": proposal_schema["asset_library"],
-            "asset_layout_rules": proposal_schema["asset_layout_rules"],
-            "storyboard_script": execution_schema["storyboard_script"],
-            "voiceover_script": execution_schema["voiceover_script"],
-            "validation_report": execution_schema["validation_report"],
-        },
-    }
-
-
-def build_full_schema_compact() -> dict:
-    proposal_schema = build_proposal_schema_compact()["properties"]
-    execution_schema = build_execution_schema_compact()["properties"]
-    return {
-        "type": "OBJECT",
-        "required": [
-            "mode",
-            "story_adaptation_outline",
-            "asset_library",
-            "asset_layout_rules",
-            "storyboard_script",
-            "voiceover_script",
-            "validation_report",
-        ],
-        "properties": {
-            "mode": {"type": "STRING", "enum": ["single"]},
-            "story_adaptation_outline": proposal_schema["story_adaptation_outline"],
-            "asset_library": proposal_schema["asset_library"],
-            "asset_layout_rules": proposal_schema["asset_layout_rules"],
-            "storyboard_script": execution_schema["storyboard_script"],
-            "voiceover_script": execution_schema["voiceover_script"],
-            "validation_report": execution_schema["validation_report"],
-        },
-    }
+    return {"type": "OBJECT", "required": required_top, "properties": top_properties}
 
 
 def build_request(args: argparse.Namespace) -> dict:
@@ -628,13 +412,6 @@ def build_request(args: argparse.Namespace) -> dict:
 
     if not args.video and not args.video_file_uri:
         raise ValueError("Provide --video or --video-file-uri.")
-    approved_proposal = load_proposal_context(args)
-    if args.mode == "single":
-        args.phase = "full"
-    if args.mode == "two-phase" and args.phase == "full":
-        raise ValueError("Mode two-phase requires --phase proposal or --phase execution.")
-    if args.mode == "two-phase" and args.phase == "execution" and not approved_proposal:
-        raise ValueError("Phase execution requires --proposal-file or --proposal-json.")
 
     parts = []
     if args.video_file_uri:
@@ -647,8 +424,6 @@ def build_request(args: argparse.Namespace) -> dict:
             }
         )
     elif args.video and is_url(args.video):
-        # For URL sources (for example YouTube watch links), pass URI directly
-        # instead of downloading bytes and forcing inline_data.
         parts.append(
             {
                 "file_data": {
@@ -665,26 +440,11 @@ def build_request(args: argparse.Namespace) -> dict:
 
     parts.append(
         {
-            "text": build_seedance_prompt(
-                brief, args.reference, args.mode, args.phase, approved_proposal, args.output_profile
-            )
+            "text": build_seedance_prompt(brief, args.reference, args.output_profile)
         }
     )
 
-    if args.output_profile == "compact":
-        if args.mode == "single":
-            response_schema = build_full_schema_compact()
-        elif args.phase == "proposal":
-            response_schema = build_proposal_schema_compact()
-        else:
-            response_schema = build_execution_schema_compact()
-    else:
-        if args.mode == "single":
-            response_schema = build_full_schema()
-        elif args.phase == "proposal":
-            response_schema = build_proposal_schema()
-        else:
-            response_schema = build_execution_schema()
+    response_schema = build_schema(args.output_profile)
 
     return {
         "contents": [{"role": "user", "parts": parts}],
@@ -758,26 +518,6 @@ def unwrap_response_json(response: dict) -> dict:
         return response
     return response
 
-
-def has_english_dialogue_or_voice(result: dict) -> bool:
-    if not isinstance(result, dict):
-        return False
-    for shot in result.get("storyboard_script", []):
-        if not isinstance(shot, dict):
-            continue
-        dialogue = shot.get("dialogue", "")
-        audio = shot.get("audio", "")
-        if isinstance(dialogue, str) and ENGLISH_WORD_RE.search(dialogue):
-            return True
-        if isinstance(audio, str) and ENGLISH_WORD_RE.search(audio):
-            return True
-    for line in result.get("voiceover_script", []):
-        if not isinstance(line, dict):
-            continue
-        value = line.get("line", "")
-        if isinstance(value, str) and ENGLISH_WORD_RE.search(value):
-            return True
-    return False
 
 
 def normalize_structured_output(result: dict) -> dict:
@@ -950,24 +690,6 @@ def normalize_structured_output(result: dict) -> dict:
     return result
 
 
-def build_chinese_repair_payload(args: argparse.Namespace, schema: dict, result: dict) -> dict:
-    prompt = (
-        "你是 JSON 语言修正器。将下面 JSON 中所有字符串值改写为简体中文，"
-        "只做语言转换，不改动结构、不删字段、不新增字段。"
-        "JSON key 必须保持英文原样。保留 @资产标签、ID、数字、比例、时长。"
-        "输出必须是合法 JSON。\n\n"
-        f"待修正 JSON：\n{json.dumps(result, ensure_ascii=False)}"
-    )
-    return {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": schema,
-            "temperature": 0.2,
-        },
-    }
-
-
 def main() -> int:
     try:
         args = parse_args()
@@ -977,11 +699,7 @@ def main() -> int:
             return 0
         response = send_request(args, payload)
         parsed = unwrap_response_json(response)
-        schema = payload.get("generationConfig", {}).get("responseSchema", {})
-        if has_english_dialogue_or_voice(parsed):
-            repair_payload = build_chinese_repair_payload(args, schema, parsed)
-            repair_response = send_request(args, repair_payload)
-            parsed = unwrap_response_json(repair_response)
+        # 仅使用本地后处理，不再发起二次 API 调用做中文修复
         parsed = normalize_structured_output(parsed)
         write_output(args.output, parsed)
         return 0

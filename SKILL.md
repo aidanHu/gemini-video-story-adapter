@@ -12,11 +12,10 @@ Prefer structured JSON output that downstream tools can validate. Keep the model
 ## Workflow
 
 1. Normalize the inputs.
-2. Default to `single` mode unless the user explicitly wants staged review.
-3. Build the analysis prompt around the user's remake goal and Seedance constraints.
-4. Call Gemini using native `generateContent` format.
-5. Validate the JSON shape before presenting results.
-6. If the user wants, render the JSON into readable tables after validation.
+2. Build the analysis prompt around the user's remake goal and Seedance constraints.
+3. Call Gemini using native `generateContent` format (single-pass, one API call).
+4. Validate the JSON shape before presenting results.
+5. If the user wants, render the JSON into readable tables after validation.
 
 ## Input Normalization
 
@@ -43,7 +42,7 @@ Use [api-summary.md](./references/api-summary.md) when you need the exact proxy 
 
 Use [run_analysis.py](./scripts/run_analysis.py) when you want a ready-made request builder and API caller.
 
-Use [seedance-structured-prompt.md](./references/seedance-structured-prompt.md) when the user wants Seedance 2.0 prompt engineering, micro-innovation against a benchmark video, or explicit control over single-pass vs two-phase output.
+Use [seedance-structured-prompt.md](./references/seedance-structured-prompt.md) when the user wants Seedance 2.0 prompt engineering or micro-innovation against a benchmark video.
 
 ## Required Config
 
@@ -102,27 +101,11 @@ Character mapping table (must be enforced in analysis):
 Use these labels as stable identifiers for asset anchoring. Keep script/dialogue names as original character names.
 Do not output any hair-related descriptors in角色提示词或分镜提示词（发型、发色、长短等均禁止）。
 
-Mode-specific output contract:
+## Output
 
-- `single` (default): `global_visual_definition`, `story_adaptation_outline`, `asset_library`, `asset_layout_rules`, `storyboard_script`, `voiceover_script`, `validation_report`
-- `two-phase proposal`: `global_visual_definition`, `story_adaptation_outline`, `asset_library`, `asset_layout_rules`, `approval_checkpoint`
-- `two-phase execution`: `storyboard_script`, `voiceover_script`, `validation_report`
+The script returns a single JSON package containing: `story_adaptation_outline`, `asset_library`, `asset_layout_rules`, `storyboard_script`, `voiceover_script`, `validation_report`.
 
 If the user asks for a rendered human-readable version, still generate the full JSON first, then derive the readable version from it.
-
-## Output Modes
-
-Default mode is `single`. Use it when the user wants the full result in one pass to save tokens and avoid an extra round trip.
-
-Use `two-phase` only when the user wants to inspect and approve the asset library before generating shots.
-
-Two-phase workflow:
-
-1. `--mode two-phase --phase proposal`
-2. Wait for explicit confirmation.
-3. `--mode two-phase --phase execution --proposal-file ...`
-
-Do not rely on the model to "stop itself" mid-response in a single call.
 
 ## Media Strategy
 
@@ -156,7 +139,6 @@ Use this script for most runs:
 python3 ./scripts/run_analysis.py \
   --video ./input/source.mp4 \
   --brief "改编成90秒悬疑短片，保留母女关系，把结局改成开放式。" \
-  --mode single \
   --output-profile compact \
   --reference ./refs/look-1.jpg \
   --reference https://example.com/look-2.png \
@@ -174,27 +156,6 @@ export YUNWU_BASE_URL="https://yunwu.ai"
 python3 ./scripts/run_analysis.py \
   --video ./input/source.mp4 \
   --brief-file ./brief.txt \
-  --mode single \
-  --reference ./refs/look-1.jpg \
-  --output ./tmp/result.json
-```
-
-Strict two-phase mode:
-
-```bash
-python3 ./scripts/run_analysis.py \
-  --video ./input/source.mp4 \
-  --brief-file ./brief.txt \
-  --mode two-phase \
-  --phase proposal \
-  --output ./tmp/proposal.json
-
-python3 ./scripts/run_analysis.py \
-  --video ./input/source.mp4 \
-  --brief-file ./brief.txt \
-  --mode two-phase \
-  --phase execution \
-  --proposal-file ./tmp/proposal.json \
   --reference ./refs/look-1.jpg \
   --output ./tmp/result.json
 ```
