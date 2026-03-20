@@ -788,7 +788,11 @@ def normalize_structured_output(result: dict) -> dict:
             # Ensure role/prop assets keep clean white-background sheets for stable downstream generation.
             if is_role or is_prop:
                 white_bg_phrase = "纯白背景（#FFFFFF），无环境元素"
-                four_view_phrase = "四视图（正面全身、侧面全身、背面全身、局部主要特征特写），各视图绝对不能重叠"
+                four_view_phrase = (
+                    "四视图（正面全身、侧面全身、背面全身、局部主要特征特写），各视图绝对不能重叠"
+                    if is_role
+                    else "四视图（正面、侧面、背面、局部主要特征特写），各视图绝对不能重叠"
+                )
                 if white_bg_phrase not in layout:
                     asset["layout"] = f"{layout}。{white_bg_phrase}".strip("。")
                 if four_view_phrase not in asset["layout"]:
@@ -803,6 +807,19 @@ def normalize_structured_output(result: dict) -> dict:
                     cleaned = cleaned.replace(f"，{phrase}", "").replace(f"。{phrase}", "")
                     cleaned = cleaned.replace(phrase, "")
                 asset["full_prompt_string"] = cleaned.strip("，。 ")
+
+            if is_prop:
+                wearable_markers = ["泳衣", "服装", "裙", "衣", "裤", "鞋", "帽", "手套", "盔甲", "尾巴"]
+                is_wearable_prop = any(marker in tag or marker in str(asset.get("visual_anchor", "")) for marker in wearable_markers)
+                if is_wearable_prop:
+                    no_human_phrase = "无人体模特，无手持展示，无衣架"
+                    for key in ["layout", "full_prompt_string"]:
+                        value = str(asset.get(key, ""))
+                        value = value.replace("正面全身、侧面全身、背面全身、局部主要特征特写", "正面、侧面、背面、局部主要特征特写")
+                        value = value.replace("正面全身", "正面").replace("侧面全身", "侧面").replace("背面全身", "背面")
+                        if no_human_phrase not in value:
+                            value = f"{value}。{no_human_phrase}".strip("。")
+                        asset[key] = value
 
             if tag.startswith("@角色_"):
                 if not str(asset.get("wardrobe_design", "")).strip():
