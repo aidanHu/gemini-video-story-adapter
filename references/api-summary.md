@@ -80,13 +80,16 @@ Do not ask the model to "be creative" without constraints. Always bind creativit
 
 For this skill, require JSON with these top-level keys:
 
-- `source_summary`
-- `adaptation_strategy`
-- `characters`
-- `scenes`
-- `assets`
-- `storyboard`
-- `production_notes`
+- `asset_json`
+- `storyboard_json`
+- `video_prompts_json`
+
+Within those blocks:
+
+- `asset_json` should include story direction, asset library, and asset layout rules
+- `storyboard_json.storyboard_script[]` should carry image-generation-ready shot prompts
+- `storyboard_json.voiceover_script[]` should hold voice lines
+- `video_prompts_json.video_prompts[]` should be shot-level items with `shot_id`, `scela_prompt`, `dialogue`, and `audio`
 
 Each storyboard shot should carry an image-generation-ready prompt that mentions:
 
@@ -97,7 +100,15 @@ Each storyboard shot should carry an image-generation-ready prompt that mentions
 - lens or camera language
 - lighting
 - mood
-- continuity constraints
+- state consistency cues
+
+Each shot-level video prompt item should:
+
+- include `shot_id`, `scela_prompt`, `dialogue`, and `audio`
+- use `scela_prompt` to describe the visible motion progression of the shot
+- keep `dialogue` and `audio` as separate fields
+- emphasize visible acting details such as动作节奏、面部变化、眼神变化、眉毛和嘴角变化、姿态变化、情绪过渡
+- avoid extra sections like titles, notes, or analysis labels
 
 ## Failure Modes
 

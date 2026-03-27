@@ -145,12 +145,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        help="Path to write the JSON request or response.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Only build and print/write the request JSON.",
+        help="Path to write the final JSON result.",
     )
     return parser.parse_args()
 
@@ -196,31 +191,6 @@ def inline_part(source: str, expected_prefix: str) -> dict:
     }
 
 
-def build_prompt(brief: str, references: list[str]) -> str:
-    reference_lines = "\n".join(
-        f"- reference_image_{idx + 1}: use this to anchor visual continuity and style"
-        for idx, _ in enumerate(references)
-    )
-    return (
-        "You are a film development analyst and remake planner.\n"
-        "Study the source video and produce a structured adaptation package.\n"
-        "Respect the user's remake brief, preserve only the source details that still matter, "
-        "and clearly label inferred assumptions.\n\n"
-        "Required deliverable:\n"
-        "- source_summary: core premise, emotional engine, current narrative shape\n"
-        "- adaptation_strategy: what changes, what stays, why the remake works\n"
-        "- characters: role, goals, conflicts, arc, visual design notes\n"
-        "- scenes: ordered dramatic units with purpose, beats, and dependencies\n"
-        "- assets: props, sets, wardrobe, vehicles, graphics, VFX, or environment elements\n"
-        "- storyboard: shot-by-shot prompts for image generation and continuity\n"
-        "- production_notes: assumptions, risks, open questions, style bible\n\n"
-        "Storyboard prompts must be image-generation-ready and mention subject, environment, "
-        "wardrobe or props, framing, camera language, lighting, mood, and continuity anchors.\n\n"
-        f"Reference images:\n{reference_lines or '- none provided'}\n\n"
-        f"User brief:\n{brief.strip()}"
-    )
-
-
 def build_seedance_prompt(brief: str, references: list[str], output_profile: str) -> str:
     """构建 Seedance 分析 prompt，仅支持 single-pass 模式。"""
     reference_lines = "\n".join(
@@ -228,9 +198,8 @@ def build_seedance_prompt(brief: str, references: list[str], output_profile: str
         for idx, _ in enumerate(references)
     )
     phase_instruction = (
-        "Return the full package in one response: "
-        "global visual definition, story adaptation outline, asset library, asset layout rules, "
-        "storyboard script, voiceover script, and validation report."
+        "Return the full package in one response split into three top-level JSON blocks: "
+        "asset_json, storyboard_json, and video_prompts_json."
     )
     compact_instruction = (
         "Output profile is COMPACT: keep every field concise, avoid repetition, and use short practical wording."
@@ -239,66 +208,63 @@ def build_seedance_prompt(brief: str, references: list[str], output_profile: str
     )
     return (
         "Role: Seedance 2.0 image-to-video architect for realistic cinematic remakes.\n"
-        "Target platform: Seedance 2.0. Output must obey strict physical logic, stable background continuity, "
-        "and SCELA prompt methodology.\n\n"
-        "Non-negotiable rules:\n"
-        "- Character mapping table (fixed visual identifiers): "
-        "Rumi->紫发女人 | Mira->红发女人 | Zoey->黑发女人 | Jinu->黑发男人 | "
-        "Abby->红发男人 | Baby saja->蓝发男人 | Mystery->银发男人 | Romance->粉发男人.\n"
-        "- The mapping labels above are stable identifiers for asset anchoring, not literal hair or gender descriptions.\n"
-        "- When user requests role replacement, resolve names via the mapping table first.\n"
-        "- Use @角色_<原始名> as internal asset tags for library linkage; do not expose these tags in final storyboard text fields.\n"
-        "- If benchmark video and micro-innovation notes are both provided, internally detect cuts and preserve shot count, shot scale, camera motion, angle, rhythm, and transitions unless the brief explicitly overrides a shot.\n"
-        "- If benchmark first-frame screenshots are provided, use screenshot count as the final shot count authority.\n"
-        "- Character names in final storyboard text output must be anonymized as 角色A/角色B... (no real names).\n"
-        "- Do not describe hair traits in any output text fields, including asset visual anchors, full_prompt_string, first_frame_prompt, and scela_prompt.\n"
-        "- Hair-related words are forbidden: 发型, 发色, 长发, 短发, 卷发, 直发, 马尾, 刘海, 紫发, 红发, 黑发, 蓝发, 银发, 粉发.\n"
-        "- If a mapped identifier contains hair wording, treat it as internal alias only and do not render it literally in prompts.\n"
-        "- Do not add gender, age, or body-shape labels.\n"
-        "- For character assets, include explicit wardrobe/makeup/accessory design derived from the reference identity.\n"
-        "- Character assets must provide wardrobe_design, makeup_design, and accessory_design as concrete standalone fields.\n"
+        "Target platform: Seedance 2.0. Output must obey strict physical logic, stable background logic, and SCELA prompt methodology.\n\n"
+        "Output contract:\n"
+        "- Return exactly three top-level JSON blocks: asset_json, storyboard_json, video_prompts_json.\n"
+        "- Keep JSON keys in English and all string values in Simplified Chinese.\n"
+        "- Do not add extra top-level sections.\n\n"
+        "Canonical asset rules:\n"
+        "- Use compact internal asset tags like @角色A / @角色B / @道具A / @场景A.\n"
+        "- One real entity maps to one canonical asset tag.\n"
+        "- Do not split the same person, prop, or scene into multiple assets because of temporary state changes.\n"
+        "- Temporary state changes such as expression, pose, held/not-held, open/closed, damaged/clean, lighting shift, framing shift, or local room-angle change must stay in shot-level prompts.\n"
         "- Every character, prop, and scene must have an independent asset definition block.\n"
         "- Never reference an @asset in shots unless it is defined in the asset library.\n"
-        "- Every storyboard shot must explicitly include scene context and used props/assets.\n"
-        "- Every storyboard shot must include continuity notes from previous shot state.\n"
-        "- used_props must never be empty. If no prop is used in a shot, set used_props to ['无道具'].\n"
-        "- continuity_from_prev must never be empty. For the first shot, write explicit start-state continuity text.\n"
-        "- In every shot, both first_frame_prompt and scela_prompt must explicitly mention scene context and used props/assets.\n"
-        "- Zero Tags: in final storyboard text fields, do not output any tag references like @角色_X, @Reference, --ref.\n"
-        "- Zero Names: in final storyboard text fields, do not output concrete names; use 角色A/角色B... instead.\n"
-        "- Zero Shot Labels: do not include Shot 1 / 镜头1 / s1 type labels in prompt text fields.\n"
-        "- Storyboard full_prompt_string is required per shot and must start with '(单张全屏，严禁拼图，无边框，电影定格单帧)'.\n"
+        "- Use explicit source names when the source clearly provides them; otherwise use stable generic labels like 角色A / 角色B / 道具A / 场景A consistently.\n"
+        "- Do not expose internal @tags in final storyboard text fields.\n\n"
+        "Asset layout rules:\n"
         "- All asset images must be 16:9 landscape layouts.\n"
-        "- Character assets must be four-view sheets: front full-body, side full-body, back full-body, plus close-up of key visual feature.\n"
-        "- Prop assets must be four-view sheets: front, side, back, plus close-up of key visual feature.\n"
-        "- Scene assets must be three-view sheets: panorama, bird's-eye view, close-up detail.\n"
+        "- Character assets: front / side / back full-body three-view.\n"
+        "- Prop assets: front / side / back three-view.\n"
+        "- Scene assets: panorama / bird's-eye / close-up detail three-view.\n"
         "- Character and prop assets must use pure white background (#FFFFFF) with no environment elements.\n"
-        "- In character/prop asset `layout` and `full_prompt_string`, explicitly include '纯白背景/#FFFFFF/无环境元素' and '四视图' and '各视图绝对不能重叠'.\n"
-        "- Global look baseline for all assets: bright lighting and vivid rich colors.\n"
-        "- Scene assets must emphasize visually rich scene content and rich environmental details.\n"
-        "- Character/prop assets must keep pure white background with no scene/environment details.\n"
-        "- In asset visual_anchor/layout/full_prompt_string, apply scene richness only to scene assets.\n"
-        "- Perform full-coverage extraction before shots: enumerate every character (including extras), scene, and key prop from script text.\n"
-        "- Single-entity constraint: each character asset block can define only one character entity.\n"
-        "- Reference consistency redline: do not use undefined asset tags; run a full integrity self-check and add missing definitions immediately.\n"
-        "- In every storyboard shot, inherit the same bright-and-vivid visual baseline unless the user explicitly overrides it.\n"
-        "- Asset labels must be placed at top-left and must not overlap with the subject.\n"
-        "- In each asset's `layout` and `full_prompt_string`, explicitly include the matching required view specification (角色/道具四视图，场景三视图).\n"
-        "- First-frame prompts must describe t=0 state, not mid-action extremes.\n"
-        "- Lighting must be bright, readable, front-lit or side-lit. Avoid backlight and rim-dominant setups.\n"
-        "- Every shot prompt must be standalone and reusable outside the conversation. No shorthand like 'same as above'.\n"
-        "- All output string values must be in Simplified Chinese, including dialogue, audio notes, and voiceover lines.\n"
-        "- Keep JSON schema keys exactly as defined in English; only translate values.\n\n"
-        "SCELA requirements:\n"
-        "- S Subject: identity, wardrobe, pose, action potential\n"
-        "- C Camera: scale, movement, angle, focus\n"
-        "- E Effect: specific visible effect only when needed\n"
-        "- L Light/Look: realistic cinematic lighting, color, texture\n"
-        "- A Audio: ambient and key effects, on separate fields in structured output\n\n"
-        "Narrative writing rules:\n"
+        "- Scene assets must not contain any people, body parts, silhouettes, reflections of people, or character-presence cues.\n"
+        "- In character/prop asset layout and full_prompt_string, explicitly include 纯白背景/#FFFFFF/无环境元素, 三视图, and 各视图绝对不能重叠.\n"
+        "- Character assets must provide concrete wardrobe_design, makeup_design, and accessory_design fields.\n"
+        "- Do not describe hair traits in asset prompts or storyboard prompts. Hair-related words are forbidden: 发型, 发色, 长发, 短发, 卷发, 直发, 马尾, 刘海, 紫发, 红发, 黑发, 蓝发, 银发, 粉发.\n"
+        "- Do not add gender, age, or body-shape labels.\n"
+        "- Global asset baseline: bright lighting and vivid rich colors.\n\n"
+        "Storyboard rules:\n"
+        "- Every storyboard shot must explicitly include scene context and used props/assets.\n"
+        "- used_props must never be empty; use ['无道具'] when needed.\n"
+        "- full_prompt_string is required per shot and must start with '(单张全屏，严禁拼图，无边框，电影定格单帧)'.\n"
+        "- first_frame_prompt must describe the t=0 visible state, not a mid-action extreme.\n"
+        "- Character descriptions in storyboard text must stay consistent with the corresponding asset definitions.\n"
+        "- scela_prompt must be an object with subject, camera, effect, and audio.\n"
+        "- Do not include shot-number labels like Shot 1 / 镜头1 / s1 in prompt text fields.\n"
+        "- Every shot prompt must be standalone and reusable outside the conversation.\n"
+        "- Lighting must stay bright, readable, front-lit or side-lit unless the brief explicitly overrides it.\n\n"
+        "Video prompt rules:\n"
+        "- Output video_prompts_json by shot, not by scene.\n"
+        "- Each item must contain shot_id, scela_prompt, dialogue, and audio.\n"
+        "- scela_prompt should be a concise standalone natural-language paragraph describing motion from the first frame.\n"
+        "- Dialogue and audio stay as separate fields rather than being merged into one paragraph.\n"
+        "- Prefer visible acting details over abstract emotion labels.\n"
+        "- Explicitly describe facial changes, eye focus shifts, eyebrow movement, mouth changes, jaw tension, posture changes, hesitation, recoil, leaning, freezing, and emotional transition.\n"
+        "- Keep camera movement and visual priority inside scela_prompt.\n\n"
+        "SCELA rules:\n"
+        "- S Subject: identity, wardrobe, pose, action potential.\n"
+        "- C Camera: scale, movement, angle, focus.\n"
+        "- E Effect: specific visible effect only when needed.\n"
+        "- A Audio: ambient and key effects on separate structured fields.\n"
+        "- Do not output a separate light/look field.\n\n"
+        "Narrative rules:\n"
+        "- Identify what the source video is doing now.\n"
+        "- Explain how the remake should differ.\n"
+        "- Preserve only the source details that still matter.\n"
+        "- Expose uncertainty and assumptions explicitly.\n"
         "- Make environments narratively active, not just named.\n"
         "- Make poses reveal intention.\n"
-        "- Track prop state changes across shots.\n"
         "- Split shots when multiple action nodes would reduce controllability.\n\n"
         "Reference anchors:\n"
         f"{reference_lines or '- none provided'}\n\n"
@@ -311,6 +277,26 @@ def build_seedance_prompt(brief: str, references: list[str], output_profile: str
 
 def build_schema(output_profile: str) -> dict:
     """构建完整的 single-pass response schema。"""
+    scela_item = {
+        "type": "OBJECT",
+        "required": ["subject", "camera", "effect", "audio"],
+        "properties": {
+            "subject": {"type": "STRING"},
+            "camera": {"type": "STRING"},
+            "effect": {"type": "STRING"},
+            "audio": {"type": "STRING"},
+        },
+    }
+    video_prompt_item = {
+        "type": "OBJECT",
+        "required": ["shot_id", "scela_prompt", "dialogue", "audio"],
+        "properties": {
+            "shot_id": {"type": "STRING"},
+            "scela_prompt": {"type": "STRING"},
+            "dialogue": {"type": "STRING"},
+            "audio": {"type": "STRING"},
+        },
+    }
     # 资产库 schema
     if output_profile == "compact":
         asset_item = {
@@ -337,7 +323,7 @@ def build_schema(output_profile: str) -> dict:
         }
         shot_required = [
             "shot_id", "duration_seconds", "scene_tag", "scene_description",
-            "used_asset_tags", "used_props", "continuity_from_prev",
+            "used_asset_tags", "used_props",
             "full_prompt_string", "first_frame_prompt", "scela_prompt",
             "dialogue", "audio",
         ]
@@ -348,28 +334,14 @@ def build_schema(output_profile: str) -> dict:
             "scene_description": {"type": "STRING"},
             "used_asset_tags": {"type": "ARRAY", "items": {"type": "STRING"}},
             "used_props": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "continuity_from_prev": {"type": "STRING"},
             "full_prompt_string": {"type": "STRING"},
             "first_frame_prompt": {"type": "STRING"},
-            "scela_prompt": {"type": "STRING"},
+            "scela_prompt": scela_item,
             "dialogue": {"type": "STRING"},
             "audio": {"type": "STRING"},
             "referenced_assets": {"type": "ARRAY", "items": {"type": "STRING"}},
         }
-        validation_required = [
-            "undefined_asset_tags", "missing_scene_context_shots",
-            "missing_prop_context_shots", "rule_violations",
-        ]
-        validation_properties = {
-            "undefined_asset_tags": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "missing_scene_context_shots": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "missing_prop_context_shots": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "rule_violations": {"type": "ARRAY", "items": {"type": "STRING"}},
-        }
-        required_top = [
-            "story_adaptation_outline", "asset_library", "asset_layout_rules",
-            "storyboard_script", "voiceover_script", "validation_report",
-        ]
+        asset_json_required = ["story_adaptation_outline", "asset_library", "asset_layout_rules"]
     else:
         asset_item = {
             "type": "OBJECT",
@@ -401,7 +373,7 @@ def build_schema(output_profile: str) -> dict:
         }
         shot_required = [
             "shot_id", "theme", "duration_seconds", "scene_tag", "scene_description",
-            "used_asset_tags", "used_props", "continuity_from_prev",
+            "used_asset_tags", "used_props",
             "aspect_ratio", "narrative_mode",
             "full_prompt_string", "first_frame_prompt", "scela_prompt",
             "dialogue", "audio",
@@ -414,61 +386,28 @@ def build_schema(output_profile: str) -> dict:
             "scene_description": {"type": "STRING"},
             "used_asset_tags": {"type": "ARRAY", "items": {"type": "STRING"}},
             "used_props": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "continuity_from_prev": {"type": "STRING"},
             "aspect_ratio": {"type": "STRING"},
             "narrative_mode": {"type": "STRING"},
             "full_prompt_string": {"type": "STRING"},
             "benchmark_inheritance": {"type": "ARRAY", "items": {"type": "STRING"}},
             "override_notes": {"type": "ARRAY", "items": {"type": "STRING"}},
             "first_frame_prompt": {"type": "STRING"},
-            "scela_prompt": {"type": "STRING"},
+            "scela_prompt": scela_item,
             "dialogue": {"type": "STRING"},
             "audio": {"type": "STRING"},
             "referenced_assets": {"type": "ARRAY", "items": {"type": "STRING"}},
         }
-        validation_required = [
-            "undefined_asset_tags", "missing_scene_context_shots",
-            "missing_prop_context_shots", "shot_count_check", "rule_violations",
-        ]
-        validation_properties = {
-            "undefined_asset_tags": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "missing_scene_context_shots": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "missing_prop_context_shots": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "shot_count_check": {"type": "STRING"},
-            "rule_violations": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "assumptions": {"type": "ARRAY", "items": {"type": "STRING"}},
-        }
-        required_top = [
-            "global_visual_definition", "story_adaptation_outline",
-            "asset_library", "asset_layout_rules",
-            "storyboard_script", "voiceover_script", "validation_report",
+        asset_json_required = [
+            "global_visual_definition", "story_adaptation_outline", "asset_library", "asset_layout_rules",
         ]
 
-    top_properties = {
+    asset_json_properties = {
         "story_adaptation_outline": story_outline,
         "asset_library": {"type": "ARRAY", "items": asset_item},
         "asset_layout_rules": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "storyboard_script": {
-            "type": "ARRAY",
-            "items": {"type": "OBJECT", "required": shot_required, "properties": shot_properties},
-        },
-        "voiceover_script": {
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "required": ["shot_id", "line"],
-                "properties": {"shot_id": {"type": "STRING"}, "line": {"type": "STRING"}},
-            },
-        },
-        "validation_report": {
-            "type": "OBJECT",
-            "required": validation_required,
-            "properties": validation_properties,
-        },
     }
-    # full 模式额外需要 global_visual_definition
     if output_profile != "compact":
-        top_properties["global_visual_definition"] = {
+        asset_json_properties["global_visual_definition"] = {
             "type": "OBJECT",
             "required": ["target_platform", "visual_style", "narrative_mode", "runtime_strategy", "continuity_rules"],
             "properties": {
@@ -481,7 +420,46 @@ def build_schema(output_profile: str) -> dict:
             },
         }
 
-    return {"type": "OBJECT", "required": required_top, "properties": top_properties}
+    top_properties = {
+        "asset_json": {
+            "type": "OBJECT",
+            "required": asset_json_required,
+            "properties": asset_json_properties,
+        },
+        "storyboard_json": {
+            "type": "OBJECT",
+            "required": ["storyboard_script", "voiceover_script"],
+            "properties": {
+                "storyboard_script": {
+                    "type": "ARRAY",
+                    "items": {"type": "OBJECT", "required": shot_required, "properties": shot_properties},
+                },
+                "voiceover_script": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "required": ["shot_id", "line"],
+                        "properties": {"shot_id": {"type": "STRING"}, "line": {"type": "STRING"}},
+                    },
+                },
+            },
+        },
+        "video_prompts_json": {
+            "type": "OBJECT",
+            "required": ["video_prompts"],
+            "properties": {
+                "video_prompts": {
+                    "type": "ARRAY",
+                    "items": video_prompt_item,
+                }
+            },
+        },
+    }
+    return {
+        "type": "OBJECT",
+        "required": ["asset_json", "storyboard_json", "video_prompts_json"],
+        "properties": top_properties,
+    }
 
 
 def build_request(args: argparse.Namespace) -> dict:
@@ -540,10 +518,54 @@ def build_request(args: argparse.Namespace) -> dict:
     }
 
 
+def build_renderer_bridge_payloads(payload: dict) -> tuple[dict, dict, dict] | None:
+    if not isinstance(payload, dict):
+        return None
+    asset_json = payload.get("asset_json")
+    storyboard_json = payload.get("storyboard_json")
+    video_prompts_json = payload.get("video_prompts_json")
+    if not isinstance(asset_json, dict) or not isinstance(storyboard_json, dict) or not isinstance(video_prompts_json, dict):
+        return None
+
+    assets_payload = {
+        "asset_library": list(asset_json.get("asset_library", [])) if isinstance(asset_json.get("asset_library"), list) else []
+    }
+    global_visual_definition = asset_json.get("global_visual_definition")
+    if isinstance(global_visual_definition, dict):
+        visual_style = str(global_visual_definition.get("visual_style", "")).strip()
+        if visual_style:
+            assets_payload["style_descriptor"] = visual_style
+
+    storyboard_payload = {
+        "storyboard_script": list(storyboard_json.get("storyboard_script", [])) if isinstance(storyboard_json.get("storyboard_script"), list) else []
+    }
+    raw_video_prompts = video_prompts_json.get("video_prompts")
+    image_to_video_payload = {
+        "video_prompts": list(raw_video_prompts) if isinstance(raw_video_prompts, list) else []
+    }
+    return assets_payload, storyboard_payload, image_to_video_payload
+
+
+def write_renderer_bridge_files(path: str, payload: dict) -> None:
+    bridge = build_renderer_bridge_payloads(payload)
+    if not bridge:
+        return
+    assets_payload, storyboard_payload, image_to_video_payload = bridge
+    output_path = Path(path)
+    output_dir = output_path.parent if output_path.suffix else output_path
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "assets.json").write_text(json.dumps(assets_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "storyboard.json").write_text(json.dumps(storyboard_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "video_prompts.json").write_text(json.dumps(image_to_video_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def write_output(path: str | None, payload: dict) -> None:
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     if path:
-        Path(path).write_text(text + "\n", encoding="utf-8")
+        output_path = Path(path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text + "\n", encoding="utf-8")
+        write_renderer_bridge_files(path, payload)
     else:
         print(text)
 
@@ -566,22 +588,6 @@ def build_result_envelope(
     payload["retry_guidance"] = retry_guidance
     payload["server_request_ids"] = dict(request_meta or {})
     return payload
-
-
-def validate_analysis_result(result: dict) -> None:
-    if not isinstance(result, dict):
-        raise ValueError("API did not return a JSON object.")
-    required = [
-        "story_adaptation_outline",
-        "asset_library",
-        "asset_layout_rules",
-        "storyboard_script",
-        "voiceover_script",
-        "validation_report",
-    ]
-    missing = [key for key in required if key not in result]
-    if missing:
-        raise ValueError(f"Analysis result is missing required keys: {', '.join(missing)}")
 
 
 def extract_request_meta(headers) -> dict:
@@ -772,7 +778,36 @@ def normalize_structured_output(result: dict) -> dict:
     if not isinstance(result, dict):
         return result
 
-    assets = result.get("asset_library")
+    # Backward compatibility: fold legacy flat output into the new three-block structure.
+    if "asset_json" not in result:
+        asset_json = {}
+        for key in ["global_visual_definition", "story_adaptation_outline", "asset_library", "asset_layout_rules"]:
+            if key in result:
+                asset_json[key] = result.get(key)
+        result["asset_json"] = asset_json
+    if "storyboard_json" not in result:
+        storyboard_json = {}
+        for key in ["storyboard_script", "voiceover_script"]:
+            if key in result:
+                storyboard_json[key] = result.get(key)
+        result["storyboard_json"] = storyboard_json
+    if "video_prompts_json" not in result:
+        result["video_prompts_json"] = {}
+
+    asset_json = result.get("asset_json")
+    if not isinstance(asset_json, dict):
+        asset_json = {}
+        result["asset_json"] = asset_json
+    storyboard_json = result.get("storyboard_json")
+    if not isinstance(storyboard_json, dict):
+        storyboard_json = {}
+        result["storyboard_json"] = storyboard_json
+    video_prompts_json = result.get("video_prompts_json")
+    if not isinstance(video_prompts_json, dict):
+        video_prompts_json = {}
+        result["video_prompts_json"] = video_prompts_json
+
+    assets = asset_json.get("asset_library")
     if isinstance(assets, list):
         for asset in assets:
             if not isinstance(asset, dict):
@@ -782,31 +817,39 @@ def normalize_structured_output(result: dict) -> dict:
             layout = str(asset.get("layout", ""))
             full_prompt = str(asset.get("full_prompt_string", ""))
 
-            is_role = tag.startswith("@角色_") or ("角色" in category)
-            is_prop = tag.startswith("@道具_") or ("道具" in category)
+            is_role = tag.startswith("@角色") or ("角色" in category)
+            is_prop = tag.startswith("@道具") or ("道具" in category)
+            is_scene = tag.startswith("@场景") or ("场景" in category)
 
             # Ensure role/prop assets keep clean white-background sheets for stable downstream generation.
             if is_role or is_prop:
                 white_bg_phrase = "纯白背景（#FFFFFF），无环境元素"
-                four_view_phrase = (
-                    "四视图（正面全身、侧面全身、背面全身、局部主要特征特写），各视图绝对不能重叠"
+                three_view_phrase = (
+                    "三视图（正面全身、侧面全身、背面全身），各视图绝对不能重叠"
                     if is_role
-                    else "四视图（正面、侧面、背面、局部主要特征特写），各视图绝对不能重叠"
+                    else "三视图（正面、侧面、背面），各视图绝对不能重叠"
                 )
                 if white_bg_phrase not in layout:
                     asset["layout"] = f"{layout}。{white_bg_phrase}".strip("。")
-                if four_view_phrase not in asset["layout"]:
-                    asset["layout"] = f"{asset['layout']}。{four_view_phrase}".strip("。")
+                if three_view_phrase not in asset["layout"]:
+                    asset["layout"] = f"{asset['layout']}。{three_view_phrase}".strip("。")
                 if white_bg_phrase not in full_prompt:
                     asset["full_prompt_string"] = f"{full_prompt}，{white_bg_phrase}".strip("，")
-                if four_view_phrase not in asset["full_prompt_string"]:
-                    asset["full_prompt_string"] = f"{asset['full_prompt_string']}，{four_view_phrase}".strip("，")
+                if three_view_phrase not in asset["full_prompt_string"]:
+                    asset["full_prompt_string"] = f"{asset['full_prompt_string']}，{three_view_phrase}".strip("，")
                 # Strip scene-rich wording from role/prop prompts to avoid conflicts with white-background assets.
                 cleaned = str(asset.get("full_prompt_string", ""))
                 for phrase in ["环境细节丰富", "丰富的环境细节", "场景内容丰富", "丰富场景细节", "场景细节丰富"]:
                     cleaned = cleaned.replace(f"，{phrase}", "").replace(f"。{phrase}", "")
                     cleaned = cleaned.replace(phrase, "")
                 asset["full_prompt_string"] = cleaned.strip("，。 ")
+
+            if is_scene:
+                no_people_phrase = "空场景，无人物，无人体局部，无人物倒影"
+                if no_people_phrase not in layout:
+                    asset["layout"] = f"{layout}。{no_people_phrase}".strip("。")
+                if no_people_phrase not in str(asset.get("full_prompt_string", "")):
+                    asset["full_prompt_string"] = f"{str(asset.get('full_prompt_string', ''))}，{no_people_phrase}".strip("，")
 
             if is_prop:
                 wearable_markers = ["泳衣", "服装", "裙", "衣", "裤", "鞋", "帽", "手套", "盔甲", "尾巴"]
@@ -815,13 +858,13 @@ def normalize_structured_output(result: dict) -> dict:
                     no_human_phrase = "无人体模特，无手持展示，无衣架"
                     for key in ["layout", "full_prompt_string"]:
                         value = str(asset.get(key, ""))
-                        value = value.replace("正面全身、侧面全身、背面全身、局部主要特征特写", "正面、侧面、背面、局部主要特征特写")
+                        value = value.replace("三视图（正面全身、侧面全身、背面全身），各视图绝对不能重叠", "三视图（正面、侧面、背面），各视图绝对不能重叠")
                         value = value.replace("正面全身", "正面").replace("侧面全身", "侧面").replace("背面全身", "背面")
                         if no_human_phrase not in value:
                             value = f"{value}。{no_human_phrase}".strip("。")
                         asset[key] = value
 
-            if tag.startswith("@角色_"):
+            if tag.startswith("@角色"):
                 if not str(asset.get("wardrobe_design", "")).strip():
                     anchor = str(asset.get("visual_anchor", "")).strip()
                     asset["wardrobe_design"] = (
@@ -834,36 +877,16 @@ def normalize_structured_output(result: dict) -> dict:
                 if not str(asset.get("accessory_design", "")).strip():
                     asset["accessory_design"] = "简洁写实配饰方案，材质与服装统一，服务角色身份表达。"
 
-    shots = result.get("storyboard_script")
+    shots = storyboard_json.get("storyboard_script")
     if isinstance(shots, list):
-        # Build deterministic role alias mapping used in storyboard text.
-        role_alias_map: dict[str, str] = {}
-        role_index = 0
+        # Build deterministic role name mapping used in storyboard text.
+        role_name_map: dict[str, str] = {}
         for asset in assets if isinstance(assets, list) else []:
             if not isinstance(asset, dict):
                 continue
             tag = str(asset.get("asset_tag", ""))
-            if tag.startswith("@角色_") and tag not in role_alias_map:
-                role_alias_map[tag] = f"角色{chr(ord('A') + role_index)}"
-                role_index += 1
-
-        known_names = [
-            "Rumi",
-            "Mira",
-            "Zoey",
-            "Jinu",
-            "Abby",
-            "Baby saja",
-            "Mystery",
-            "Romance",
-            "Doctor",
-            "C罗",
-            "梅西",
-            "内马尔",
-        ]
-        name_alias_map: dict[str, str] = {}
-        for idx, n in enumerate(known_names):
-            name_alias_map[n] = f"角色{chr(ord('A') + (idx % 26))}"
+            if tag.startswith("@角色") and tag not in role_name_map:
+                role_name_map[tag] = tag[1:].split("_", 1)[0]
 
         def sanitize_story_text(value: str) -> str:
             text = str(value or "")
@@ -871,23 +894,49 @@ def normalize_structured_output(result: dict) -> dict:
                 return text
             # Remove shot numbering labels.
             text = SHOT_LABEL_RE.sub("", text)
-            # Replace role tags first.
-            for tag, alias in role_alias_map.items():
-                text = text.replace(tag, alias)
+            # Replace role tags with original character names.
+            for tag, name in role_name_map.items():
+                text = text.replace(tag, name)
             # Remove any residual @tags/--ref directives.
             text = ASSET_TAG_RE.sub("", text)
-            # Replace known concrete names with anonymized role aliases.
-            for name, alias in name_alias_map.items():
-                text = text.replace(name, alias)
             # Clean duplicated punctuation and spaces.
             text = re.sub(r"\s{2,}", " ", text).strip(" ，。;；")
             return text
+
+        def sanitize_scela(value) -> dict[str, str]:
+            if isinstance(value, dict):
+                raw = value
+            else:
+                raw_text = sanitize_story_text(str(value or ""))
+                raw = {
+                    "subject": raw_text,
+                    "camera": "",
+                    "effect": "",
+                    "audio": "",
+                }
+            return {
+                "subject": sanitize_story_text(str(raw.get("subject", ""))),
+                "camera": sanitize_story_text(str(raw.get("camera", ""))),
+                "effect": sanitize_story_text(str(raw.get("effect", ""))),
+                "audio": sanitize_story_text(str(raw.get("audio", ""))),
+            }
+
+        def dedupe_keep_order(values: list[str]) -> list[str]:
+            seen: set[str] = set()
+            out: list[str] = []
+            for value in values:
+                key = value.strip()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                out.append(key)
+            return out
 
         for idx, shot in enumerate(shots):
             if not isinstance(shot, dict):
                 continue
             if not str(shot.get("scene_tag", "")).strip():
-                shot["scene_tag"] = "@场景_未标注"
+                shot["scene_tag"] = "@场景A"
             if not str(shot.get("scene_description", "")).strip():
                 shot["scene_description"] = "场景描述缺失，需补充空间结构、光线状态与环境细节。"
 
@@ -898,12 +947,6 @@ def normalize_structured_output(result: dict) -> dict:
             used_props = shot.get("used_props")
             if not isinstance(used_props, list) or len(used_props) == 0:
                 shot["used_props"] = ["无道具"]
-
-            if not str(shot.get("continuity_from_prev", "")).strip():
-                if idx == 0:
-                    shot["continuity_from_prev"] = "起始镜头，无上一镜头，建立角色与环境初始状态。"
-                else:
-                    shot["continuity_from_prev"] = "承接上一镜头的角色位置、动作趋势与道具状态。"
 
             # Enforce standalone single-frame prompt with fixed prefix.
             frame_prefix = "(单张全屏，严禁拼图，无边框，电影定格单帧)"
@@ -918,29 +961,64 @@ def normalize_structured_output(result: dict) -> dict:
 
             for key in [
                 "scene_description",
-                "continuity_from_prev",
                 "first_frame_prompt",
-                "scela_prompt",
                 "dialogue",
                 "audio",
             ]:
                 shot[key] = sanitize_story_text(str(shot.get(key, "")))
+            shot["scela_prompt"] = sanitize_scela(shot.get("scela_prompt"))
 
-    report = result.get("validation_report")
-    if not isinstance(report, dict):
-        report = {}
-        result["validation_report"] = report
-    if "missing_scene_context_shots" not in report or not isinstance(
-        report.get("missing_scene_context_shots"), list
-    ):
-        report["missing_scene_context_shots"] = []
-    if "missing_prop_context_shots" not in report or not isinstance(
-        report.get("missing_prop_context_shots"), list
-    ):
-        report["missing_prop_context_shots"] = []
+    video_prompts = video_prompts_json.get("video_prompts")
+    if not isinstance(video_prompts, list):
+        video_prompts = []
+    if not video_prompts and isinstance(shots, list):
+        generated_video_prompts = []
+        for shot in shots:
+            if not isinstance(shot, dict):
+                continue
+            shot_id = str(shot.get("shot_id", "")).strip()
+            if not shot_id:
+                continue
+            scela = sanitize_scela(shot.get("scela_prompt"))
+            scela_text = "，".join(
+                value for value in [
+                    scela.get("subject", ""),
+                    scela.get("camera", ""),
+                    scela.get("effect", ""),
+                ] if value
+            ).strip("，。 ")
+            if not scela_text:
+                scela_text = sanitize_story_text(str(shot.get("first_frame_prompt", "")))
+            generated_video_prompts.append(
+                {
+                    "shot_id": shot_id,
+                    "scela_prompt": scela_text,
+                    "dialogue": sanitize_story_text(str(shot.get("dialogue", ""))),
+                    "audio": sanitize_story_text(str(shot.get("audio", ""))),
+                }
+            )
+        video_prompts = generated_video_prompts
+    else:
+        normalized_video_prompts = []
+        for item in video_prompts:
+            if not isinstance(item, dict):
+                continue
+            shot_id = str(item.get("shot_id", "")).strip()
+            if not shot_id:
+                continue
+            normalized_video_prompts.append(
+                {
+                    "shot_id": shot_id,
+                    "scela_prompt": sanitize_story_text(str(item.get("scela_prompt", ""))),
+                    "dialogue": sanitize_story_text(str(item.get("dialogue", ""))),
+                    "audio": sanitize_story_text(str(item.get("audio", ""))),
+                }
+            )
+        video_prompts = normalized_video_prompts
+    video_prompts_json["video_prompts"] = video_prompts
 
-    # Ensure voiceover lines also satisfy zero-name/zero-tag constraint.
-    voice_lines = result.get("voiceover_script")
+    # Ensure voiceover lines satisfy zero-tag constraint while preserving original character names.
+    voice_lines = storyboard_json.get("voiceover_script")
     if isinstance(voice_lines, list):
         for item in voice_lines:
             if not isinstance(item, dict):
@@ -948,8 +1026,6 @@ def normalize_structured_output(result: dict) -> dict:
             line = str(item.get("line", ""))
             line = SHOT_LABEL_RE.sub("", line)
             line = ASSET_TAG_RE.sub("", line)
-            for n in ["Rumi", "Mira", "Zoey", "Jinu", "Abby", "Baby saja", "Mystery", "Romance", "Doctor", "C罗", "梅西", "内马尔"]:
-                line = line.replace(n, "角色A")
             item["line"] = re.sub(r"\s{2,}", " ", line).strip(" ，。;；")
 
     return result
@@ -959,18 +1035,12 @@ def main() -> int:
     args: argparse.Namespace | None = None
     try:
         args = parse_args()
-        # 防重入：dry-run 模式不需要 lock（不会发起真实请求）
-        if not args.dry_run:
-            acquire_lock(args.output)
+        acquire_lock(args.output)
         payload = build_request(args)
-        if args.dry_run:
-            write_output(args.output, payload)
-            return 0
         response, request_meta = send_request(args, payload)
         parsed = unwrap_response_json(response)
         # 仅使用本地后处理，不再发起二次 API 调用做中文修复
         parsed = normalize_structured_output(parsed)
-        validate_analysis_result(parsed)
         write_output(
             args.output,
             build_result_envelope(

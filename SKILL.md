@@ -5,61 +5,132 @@ description: Analyze a source video plus an adaptation brief, reference images, 
 
 # Gemini Video Story Adapter
 
-Use this skill to turn raw source material into a reusable adaptation package instead of a loose prose summary.
+Use this skill to turn a source video, an adaptation brief, and optional reference images into a three-block preproduction package:
 
-Prefer structured JSON output that downstream tools can validate. Keep the model focused on adaptation, not transcription.
+- `asset_json`
+- `storyboard_json`
+- `video_prompts_json`
 
-## Workflow
+It is a single-pass Gemini analysis workflow for remake planning, not a generic prose summarizer.
 
-1. Normalize the inputs.
-2. Build the analysis prompt around the user's remake goal and Seedance constraints.
-3. Call Gemini using native `generateContent` format (single-pass, one API call).
-4. Validate the JSON shape before presenting results.
-5. If the user wants, render the JSON into readable tables after validation.
+## Current Workflow
 
-## Input Normalization
+1. Normalize the source video, adaptation brief, and reference images.
+2. Build one Gemini native `generateContent` request with a strict JSON schema.
+3. Ask for three structured blocks: assets, storyboard, and shot-level video prompts.
+4. Apply local post-processing to normalize tags, clean prompt text, and fill safe defaults where needed.
+5. If `--output` is provided, write the full result JSON and also emit renderer-ready `assets.json` and `storyboard.json` in the same directory.
+6. Optionally render the JSON into a human-readable summary after generation.
 
-Collect as many of these as the user can provide:
+## Inputs
 
-- Source video: local file path, direct video URL, or an existing Gemini `file_uri`.
-- Adaptation brief: what should change, what must stay, target platform, duration, tone, genre, audience.
-- Reference images: local paths or URLs for style, costume, environment, lighting, lensing, or character appearance.
-- Hard constraints: budget, cast count, locations, era, aspect ratio, language, censorship/safety limits.
+Provide as many of these as useful:
 
-Ask for missing constraints only when they materially affect the output. If the brief is vague, infer a conservative adaptation thesis and label it as inferred.
+- Source video: local path, direct video URL, or Gemini `file_uri`
+- Adaptation brief: what changes, what stays, target platform, duration, tone, genre, audience
+- Reference images: local paths or URLs for style, costume, environment, lighting, lensing, or appearance anchoring
+- Hard constraints: budget, cast count, locations, era, aspect ratio, language, censorship/safety limits
 
-## Payload Rules
+If the brief is vague, the skill should infer a conservative adaptation direction and treat it as inferred rather than as confirmed fact.
 
-Use Gemini native `contents` and `parts`. Keep media parts separate from text parts.
+## Output Contract
 
-- For small local or downloaded files, use `inline_data` with base64 bytes.
-- For existing uploaded Gemini files, use `file_data` with `file_uri`.
-- Put the creative brief in a plain text part after the media parts.
+The skill asks Gemini for exactly three top-level JSON blocks:
+
+- `asset_json`
+- `storyboard_json`
+- `video_prompts_json`
+
+Use English keys and Simplified Chinese values.
+
+### `asset_json`
+Use this block for:
+- story adaptation outline
+- asset library
+- asset layout rules
+- optional richer global visual definition in `full` mode
+
+### `storyboard_json`
+Use this block for:
+- shot-level storyboard prompts
+- first-frame prompts
+- SCELA objects
+- dialogue and audio fields
+- voiceover lines
+
+### `video_prompts_json`
+Use this block for:
+- shot-level video prompts only
+- one item per shot
+- fields aligned with `shot_id`, `scela_prompt`, `dialogue`, and `audio`
+
+## Core Asset Rules
+
+- Internal canonical asset tags must use compact forms like `@角色A`, `@道具A`, `@场景A`.
+- One real entity maps to one canonical asset tag.
+- Do not split the same person, prop, or scene into multiple assets because of temporary state changes.
+- Temporary state changes such as expression, pose, held/not-held, open/closed, damage, lighting shift, framing shift, or local room-angle change belong in shot-level prompts, not separate asset entries.
+- Character wording in storyboard output must stay aligned with the corresponding asset definition.
+- Use explicit source names when the source clearly provides them; otherwise use stable generic labels such as `角色A`, `角色B`, `道具A`, `场景A` consistently.
+- Never expose internal `@...` tags in final storyboard text fields.
+
+## Asset Layout Rules
+
+- All asset images must use `16:9` landscape layouts.
+- Character assets: front / side / back full-body three-view.
+- Prop assets: front / side / back three-view.
+- Scene assets: panorama / bird's-eye / close-up detail three-view.
+- Character and prop assets must use pure white background with no environment elements.
+- Scene assets must not contain people, body parts, silhouettes, reflections of people, or character-presence cues.
+- Character assets must include concrete `wardrobe_design`, `makeup_design`, and `accessory_design` fields.
+- Do not describe hair traits in asset prompts or storyboard prompts.
+- Do not add gender, age, or body-shape labels.
+
+## Storyboard Rules
+
+- Every storyboard shot must explicitly include scene context and used props/assets.
+- `used_props` must never be empty; use `['无道具']` when needed.
+- `full_prompt_string` is required per shot and must start with `(单张全屏，严禁拼图，无边框，电影定格单帧)`.
+- `first_frame_prompt` must describe the t=0 visible state, not a mid-action extreme.
+- `scela_prompt` must stay structured as an object with `subject`, `camera`, `effect`, and `audio`.
+- Do not include shot-number labels like `Shot 1` / `镜头1` / `s1` in prompt text fields.
+- Every shot prompt must be standalone and reusable outside the conversation.
+
+## Video Prompt Rules
+
+- Output `video_prompts_json` by shot, not by scene.
+- Each item must contain `shot_id`, `scela_prompt`, `dialogue`, and `audio`.
+- `scela_prompt` should be a concise standalone natural-language paragraph describing motion from the first frame.
+- Dialogue and audio stay as separate fields rather than being merged into one paragraph.
+- Emphasize visible acting detail: facial changes, eye focus shifts, eyebrow movement, mouth changes, jaw tension, posture changes, hesitation, recoil, leaning, freezing, and emotional transition.
+- Avoid vague emotion labels unless they are unfolded into visible performance details.
+
+## Request Construction
+
+Use Gemini native `contents` and `parts`.
+
+- Use `inline_data` for small local or downloaded media.
+- Use `file_data` with `file_uri` when a reusable Gemini file already exists.
+- Put the adaptation brief in a text part after media parts.
 - Set `generationConfig.responseMimeType` to `application/json`.
-- Include a concrete `responseSchema` so the model returns machine-parseable output.
+- Include a strict `responseSchema` so the model returns the required three-block structure.
 
-Use [api-summary.md](./references/api-summary.md) when you need the exact proxy endpoint or payload structure.
-
-Use [run_analysis.py](./scripts/run_analysis.py) when you want a ready-made request builder and API caller.
-
-Use [seedance-structured-prompt.md](./references/seedance-structured-prompt.md) when the user wants Seedance 2.0 prompt engineering or micro-innovation against a benchmark video.
+Useful files:
+- [api-summary.md](./references/api-summary.md)
+- [run_analysis.py](./scripts/run_analysis.py)
+- [seedance-structured-prompt.md](./references/seedance-structured-prompt.md)
 
 ## Required Config
 
-Do not attempt a live API call without auth config.
-
-Required for real requests:
-
-- `YUNWU_API_TOKEN`: required unless `--token` is passed explicitly.
+Required for live requests:
+- `YUNWU_API_TOKEN` unless `--token` is passed explicitly
 
 Optional overrides:
-
-- `YUNWU_BASE_URL`: defaults to `https://yunwu.ai`.
-- `GEMINI_BASE_URL`: fallback only if `YUNWU_BASE_URL` is absent.
-- `GEMINI_MODEL`: if set, becomes the default for `--model` (otherwise `gemini-3.1-pro-preview`).
-- `--base-url`: overrides both environment variables for the current run.
-- `--model`: overrides the default model for the current run.
-- `--output-profile`: `compact` (default, lower token cost) or `full` (more detailed fields).
+- `YUNWU_BASE_URL` or `GEMINI_BASE_URL`
+- `GEMINI_MODEL`
+- `--base-url`
+- `--model`
+- `--output-profile` (`compact` or `full`)
 
 Use [assets/.env.example](./assets/.env.example) as the starting template.
 
@@ -70,114 +141,67 @@ export YUNWU_API_TOKEN="your-token"
 export YUNWU_BASE_URL="https://yunwu.ai"
 ```
 
-If the token is missing, the script should only be used with an explicit `--dry-run` call to build the request body.
-Without `--dry-run`, the skill should not emit request-body debug files.
+If the token is missing, the script cannot run a live request.
 
 ## Execution Discipline
 
-Multi-modal video analysis requests are **heavyweight** operations. Expect the following:
+This is a heavyweight multimodal request path.
 
-- **Typical latency**: 60–180 seconds per request. Large videos or `full` profile may take longer.
-- **Request timeout**: Default `--request-timeout` is `600` seconds. No response within 600 seconds is treated as a timeout on the client side.
-- **Lock file**: The script writes `.run_analysis.lock` (containing PID) next to the output path before sending the API request. A second instance will refuse to start if the lock holder is still alive.
-- **Heartbeat**: During API wait, the script prints `[heartbeat]` lines to stderr every 10 seconds. If heartbeat output stops for over 60 seconds, the process may be dead.
-- **Retry policy**: Heavy analysis requests default to `--max-retries 0`. HTTP 429/5xx can be retried only when you opt in; HTTP 4xx errors are **never** retried.
-- **Timeout handling**: If the request waits too long and times out, the script marks the run as `analysis_status=timeout`, writes a retry guidance message, and does **not** auto-retry because the server may still be processing.
-- **Caller prohibition**: Do NOT re-run the script externally while an instance is running. Let it finish or confirm the process is dead before starting another. There is no need for external retry logic—the script handles retries internally.
+- Typical latency: 60–180 seconds
+- Default timeout: `600` seconds
+- Lock file: `.run_analysis.lock`
+- Heartbeat: stderr every 10 seconds during API wait
+- Default retry count: `0`
+- 429/5xx retries are opt-in; 4xx errors are not retried
+- Timeout writes `analysis_status=timeout` and retry guidance, but does not auto-retry
+- Do not start a second live instance while one is already running
 
-## Prompt Construction
+## Returned Envelope
 
-Frame the task as Seedance production planning, not generic summarization. The prompt should force the model to:
+On success, the final JSON also includes:
+- `analysis_status: ok`
+- `success: true`
 
-- identify what the source video is doing now
-- explain how the remake should differ
-- preserve only the source details that still matter
-- output production-ready assets, standalone first-frame prompts, SCELA prompts, and voice lines in Simplified Chinese
-- expose uncertainty and assumptions explicitly
-- respect your non-negotiable Seedance rules around assets, layout, lighting, continuity, and shot inheritance
-- keep JSON keys in English and output values in Simplified Chinese
-- enforce three-view asset rules explicitly in `layout` and `full_prompt_string`:
-- character: front/side/back full-body three-view
-- prop: front/side/back three-view
-- scene: panorama/bird's-eye/close-up three-view
-
-Character mapping table (must be enforced in analysis):
-
-- `Rumi->紫发女人`
-- `Mira->红发女人`
-- `Zoey->黑发女人`
-- `Jinu->黑发男人`
-- `Abby->红发男人`
-- `Baby saja->蓝发男人`
-- `Mystery->银发男人`
-- `Romance->粉发男人`
-
-Use these labels as stable identifiers for asset anchoring. Keep script/dialogue names as original character names.
-Do not output any hair-related descriptors in角色提示词或分镜提示词（发型、发色、长短等均禁止）。
-
-## Output
-
-On success, the script returns the analysis JSON package plus top-level status fields:
-
-- `analysis_status`: `ok`
-- `success`: `true`
-
-On failure or timeout, the script still writes a JSON object with:
-
-- `analysis_status`: `failed` or `timeout`
-- `success`: `false`
+On failure or timeout, it still includes:
+- `analysis_status`
+- `success`
 - `failure_reason`
 - `should_retry`
 - `retry_guidance`
-- `server_request_ids`（如果服务端响应头里有可追踪 request id / trace id，会一并写出）
+- `server_request_ids`
 
-Successful runs still contain: `story_adaptation_outline`, `asset_library`, `asset_layout_rules`, `storyboard_script`, `voiceover_script`, `validation_report`.
+If `--output` points to a file such as `./analysis/result.json`, the script also writes:
+- `./analysis/assets.json`
+- `./analysis/storyboard.json`
+- `./analysis/video_prompts.json`
 
-If the user asks for a rendered human-readable version, still generate the full JSON first, then derive the readable version from it.
+These side files make the output directory easier to use downstream:
+- `assets.json` and `storyboard.json` are shaped for direct consumption by `banana-previz-renderer`
+- `video_prompts.json` exposes the shot 级图生视频 prompts without forcing you to open `result.json`
+
+Recommended output layout:
+- `./analysis/result.json`
+- `./analysis/assets.json`
+- `./analysis/storyboard.json`
+- `./analysis/video_prompts.json`
+
+If you only need the shot 级图生视频 prompts, read `video_prompts.json` directly.
 
 ## Media Strategy
 
-Prefer these input modes in order:
+Prefer input modes in this order:
 
-1. Existing Gemini `file_uri` for large reusable videos.
-2. Local video file encoded as `inline_data` when comfortably under the request limit.
-3. Remote video URL downloaded locally, then encoded as `inline_data` if size allows.
+1. Existing Gemini `file_uri` for large reusable videos
+2. Local video as `inline_data` when comfortably under the request limit
+3. Remote video URL only when it can be treated as reusable remote media or safely downloaded inline
 
 For reference images, prefer `inline_data` unless the user already has a reusable uploaded URI.
 
-If the source video is too large for inline upload and no reusable file URI is available, stop and explain that the request should switch to an uploaded Gemini file workflow before analysis.
+If the source video is too large for inline upload and no reusable `file_uri` is available, switch to an uploaded Gemini file workflow first.
 
-## Validation
+## Example Usage
 
-Before presenting results:
-
-- Confirm the API returned valid JSON.
-- Confirm every storyboard shot references an existing scene.
-- Confirm every required asset is connected to at least one scene or shot.
-- Confirm characters have distinct goals or functional roles.
-- Flag guessed details under `production_notes.assumptions`.
-
-If validation fails, repair the JSON through a follow-up prompt instead of manually inventing missing sections.
-
-## Execution
-
-Use this script for most runs:
-
-```bash
-python3 ./scripts/run_analysis.py \
-  --video ./input/source.mp4 \
-  --brief "改编成90秒悬疑短片，保留母女关系，把结局改成开放式。" \
-  --output-profile compact \
-  --reference ./refs/look-1.jpg \
-  --reference https://example.com/look-2.png \
-  --model gemini-3.1-pro-preview \
-  --base-url https://yunwu.ai \
-  --dry-run
-```
-
-Only use this path when you explicitly want to inspect the request body. If you truly need a file, add `--output ./tmp/request.json`.
-
-To send the request directly:
+Live request:
 
 ```bash
 export YUNWU_API_TOKEN="..."
@@ -186,9 +210,19 @@ python3 ./scripts/run_analysis.py \
   --video ./input/source.mp4 \
   --brief-file ./brief.txt \
   --reference ./refs/look-1.jpg \
-  --output ./tmp/result.json
+  --output ./analysis/result.json
 ```
 
-The script defaults to the Yunwu proxy and Gemini native payload shape. Review the generated JSON before changing the schema.
+After the run, shot 级图生视频内容就在 `./analysis/video_prompts.json`。
 
-Use `--output-profile full` when you need richer descriptive fields and can accept higher token usage.
+Then hand off directly to renderer:
+
+```bash
+python3 ../banana-previz-renderer/scripts/run_banana_pipeline.py \
+  --analysis-json ./analysis \
+  --phase assets \
+  --identity-map-json ./role-refs.json \
+  --output-dir ./outputs
+```
+
+Use `--output-profile full` when you want richer descriptive fields and can accept higher token usage.

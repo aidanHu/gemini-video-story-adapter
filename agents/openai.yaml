@@ -1,4 +1,4 @@
 interface:
   display_name: "Gemini Video Story Adapter"
-  short_description: "将视频、改编需求和参考图转成结构化剧本与分镜方案"
-  default_prompt: "Use $gemini-video-story-adapter to analyze a source video and adaptation brief into structured story, scene, asset, and storyboard JSON."
+  short_description: "将视频、改编需求和参考图转成资产、分镜和图生视频三段式结构化方案"
+  default_prompt: "Use $gemini-video-story-adapter to analyze a source video and adaptation brief into asset_json, storyboard_json, and video_prompts_json."
